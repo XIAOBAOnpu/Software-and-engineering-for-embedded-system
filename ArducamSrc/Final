@@ -1,0 +1,438 @@
+#include <Wire.h>
+#include <ArduCAM.h>
+#include <SPI.h>
+#include "memorysaver.h"
+#include <ArduinoBLE.h>
+#include <JPEGDecoder.h>
+#include <string.h>
+
+#ifdef swap
+    #undef swap
+#endif
+#include <arduinoFFT.h>
+
+#if !(defined (OV5640_MINI_5MP_PLUS) || defined (OV5642_MINI_5MP_PLUS))
+    #error Please select the hardware platform and camera module in the ../libraries/ArduCAM/memorysaver.h file
+#endif
+
+#define FRAME_NUMBER 8
+#define MAX_JPEG_SIZE 320 * 240
+#define ROI_WIDTH 16
+#define ROI_HEIGHT 8
+#define ROI_SIZE ROI_WIDTH * ROI_HEIGHT
+
+uint8_t jpgFile[MAX_JPEG_SIZE];  // 存储JPEG数据的数组
+uint16_t jpgFileSize = 0;        
+uint8_t* greenArray;
+uint8_t* greenArray_2D[FRAME_NUMBER];
+uint8_t capGAP = 20;
+
+BLEService myService("180A"); 
+BLEIntCharacteristic heartRateCharacteristic("2A37", BLERead | BLEWrite | BLENotify); 
+
+const int CS = 10;
+static uint8_t resolution = 0;
+ArduCAM myCAM(OV5642, CS);
+
+ArduinoFFT<double> FFT;
+const uint16_t samples = 128;           // Must be a power of 2
+double vReal[samples];
+double vImag[samples];
+
+void setup() 
+{
+    if (!BLE.begin()) 
+    {
+        Serial.println("Fail to start BLE...");
+        while (1);
+    }
+
+    Serial.println("BLE starts");
+
+    BLE.setLocalName("Nano33BLE");
+    BLE.setAdvertisedService(myService);
+    myService.addCharacteristic(heartRateCharacteristic);
+    BLE.addService(myService);
+
+    BLE.advertise();
+
+    Serial.println("Waiting for connection...");
+
+    delay(1000);
+    uint8_t vid, pid;
+    uint8_t temp;
+    Wire.begin();
+    Serial.begin(921600);
+    Serial.println(F("ACK CMD ArduCAM Start!"));
+    pinMode(CS, OUTPUT);
+    digitalWrite(CS, HIGH);
+
+    SPI.begin();
+    myCAM.write_reg(0x07, 0x80);
+    delay(100);
+    myCAM.write_reg(0x07, 0x00);
+    delay(100);
+
+    while (1) 
+    {
+        myCAM.write_reg(ARDUCHIP_TEST1, 0x55);
+        temp = myCAM.read_reg(ARDUCHIP_TEST1);
+        if (temp != 0x55) {
+            Serial.println(F("ACK CMD SPI interface Error!"));
+            delay(1000);
+            continue;
+        } else {
+            Serial.println(F("ACK CMD SPI interface OK."));
+            break;
+        }
+    }
+
+    while (1) 
+    {
+        myCAM.rdSensorReg16_8(OV5642_CHIPID_HIGH, &vid);
+        myCAM.rdSensorReg16_8(OV5642_CHIPID_LOW, &pid);
+        if ((vid != 0x56) || (pid != 0x42)) {
+            Serial.println(F("ACK CMD Can't find OV5642 module!"));
+            delay(1000);
+            continue;
+        } else {
+            Serial.println(F("ACK CMD OV5642 detected."));
+            break;
+        }
+    }
+
+    myCAM.set_format(JPEG);
+    myCAM.InitCAM();
+    myCAM.write_reg(ARDUCHIP_TIM, VSYNC_LEVEL_MASK);
+    myCAM.clear_fifo_flag();
+    myCAM.write_reg(ARDUCHIP_FRAMES, 0x00);
+    myCAM.set_bit(ARDUCHIP_GPIO, GPIO_PWDN_MASK);
+    delay(800);
+}
+
+void loop() 
+{
+    BLEDevice central = BLE.central();
+    if (central) 
+    {
+        Serial.print("Nano 33 and phone connected: ");
+        Serial.println(central.address());
+        uint8_t temp = 0xff, temp_last = 0;
+        uint8_t startCapture = 0;
+        uint8_t IMGcounter = 0;
+        while (central.connected()) 
+        {
+            if (heartRateCharacteristic.written()) 
+            {
+                temp = heartRateCharacteristic.value();
+                
+                Serial.print("Data from phone: ");
+                Serial.println(temp);
+                if (temp != 0xff) 
+                {
+                    Serial.println(temp, DEC);
+                    Serial.println("===========");
+                }
+                switch (temp) 
+                {
+                    case 0:     // press 0 to start
+                        temp = 0xff;
+                        myCAM.clear_bit(ARDUCHIP_GPIO, GPIO_PWDN_MASK);
+                        myCAM.OV5642_set_JPEG_size(OV5642_320x240);
+                        Serial.println(F("ACK CMD switch to OV5642_320x240"));
+                        delay(1000);
+                        myCAM.set_bit(ARDUCHIP_GPIO, GPIO_PWDN_MASK);
+                        startCapture = 1;
+                        Serial.println(F("ACK CMD CAM start single shot."));
+                        myCAM.clear_bit(ARDUCHIP_GPIO, GPIO_PWDN_MASK);
+                        delay(800);
+                        break;
+
+                    default:
+                        break;
+                }
+                Serial.println("Start capturing..");
+
+                for (uint8_t arrayAlloc = 0; arrayAlloc < FRAME_NUMBER; arrayAlloc++)
+                {
+                    greenArray_2D[arrayAlloc] = (uint8_t*)malloc(ROI_SIZE * sizeof(uint8_t));
+                    if (greenArray_2D[arrayAlloc] == NULL) 
+                    {
+                        Serial.println("Failed to allocate memory");
+                    }
+                }
+
+                for (IMGcounter; IMGcounter < FRAME_NUMBER; IMGcounter++)
+                {
+                    greenArray = frameCapenCrop(temp, startCapture, IMGcounter);
+                    // !!!!! IMPORTANT, use memcpy to copy the content s.t. the 
+                    // new data wont cover the old data
+                    // if you use =, then the data share the same address -> COVER the old one
+                    memcpy(greenArray_2D[IMGcounter], greenArray, ROI_SIZE * sizeof(uint8_t));
+                    temp = 0x00;
+                    startCapture = 1;
+                    myCAM.flush_fifo();
+                    delay(20);
+                }
+                // show the result of  the cropped IMG (green channel only)
+                /*
+                Serial.println("IMG INFO END !");
+                for (uint8_t showIMGcount = 0; showIMGcount < FRAME_NUMBER; showIMGcount++)
+                {
+                    Serial.print("Green channel INFO No. ");
+                    Serial.println(showIMGcount + 1);
+                    for (uint16_t i = 0; i < ROI_WIDTH * ROI_HEIGHT; i++)
+                    {
+                        Serial.print(greenArray_2D[showIMGcount][i]);
+                        Serial.print(" ");
+                    }
+                    Serial.println(" ");
+                }
+                Serial.println("GREEN INFO END !");
+                */ 
+
+                // Process FFT to find heart rate
+                processFFT(greenArray_2D, FRAME_NUMBER);
+            }
+        }
+        Serial.print("Disconnected: ");
+        Serial.println(central.address());
+    }
+}
+
+uint8_t* frameCapenCrop(uint8_t temp, uint8_t startCapture, uint8_t counter)
+{
+    uint8_t temp_last;
+    static uint8_t gArray[ROI_WIDTH * ROI_HEIGHT];
+    if (startCapture == 1) 
+    {
+        myCAM.clear_fifo_flag();
+        myCAM.start_capture();
+        startCapture = 0;
+
+        unsigned long startTime = millis();
+        while (!myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) 
+        {
+            if (millis() - startTime > 5000) 
+            {
+                Serial.println(F("Capture timeout."));
+                break;
+            }
+        }
+
+        if (myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) 
+        {
+            Serial.print(F("IMG No. "));
+            Serial.print(counter + 1);
+            temp = 0;
+            //Serial.println(F(" INFO:"));
+            
+            jpgFileSize = 0; // 重置图片大小计数器
+            while ((temp != 0xD9) | (temp_last != 0xFF) && jpgFileSize < MAX_JPEG_SIZE) 
+            {
+                temp_last = temp; 
+                temp = myCAM.read_fifo(); 
+                jpgFile[jpgFileSize] = temp;
+                jpgFileSize = jpgFileSize + 1;
+            }
+            myCAM.clear_fifo_flag();
+            Serial.print(F(". Quality is: "));
+            Serial.print(jpgFileSize / 100);
+            Serial.println(F(" / 100"));
+
+            // Coded Units (MCUs), which are 16x8 blocks of pixels.
+            JpegDec.decodeArray(jpgFile, jpgFileSize);
+
+            // Number of MCUs in cropped IMG
+            const int keep_x_mcus = ROI_WIDTH / JpegDec.MCUWidth;
+            const int keep_y_mcus = ROI_HEIGHT / JpegDec.MCUHeight;
+
+            // Calculate how many MCUs we will throw away on the x axis
+            // Amount = #MCUs in ori IMG - #MCUs in cropped IMG
+            const int skip_x_mcus = JpegDec.MCUSPerRow - keep_x_mcus;
+
+            // Roughly center the crop by skipping half the throwaway MCUs at the
+            // beginning of each row
+            const int skip_start_x_mcus = skip_x_mcus / 2;
+            // Index where we will start throwing away MCUs after the data
+            const int skip_end_x_mcu_index = skip_start_x_mcus + keep_x_mcus;
+
+            // Same approach for the columns
+            const int skip_y_mcus = JpegDec.MCUSPerCol - keep_y_mcus;
+            const int skip_start_y_mcus = skip_y_mcus / 2;
+            const int skip_end_y_mcu_index = skip_start_y_mcus + keep_y_mcus;
+
+            // Pointer to the current pixel
+            uint16_t* pImg;
+            // Color of the current pixel
+            uint16_t color;
+            uint16_t MCUCount = 0;
+            uint16_t pixelCounter = JpegDec.MCUWidth * JpegDec.MCUHeight * keep_x_mcus * keep_y_mcus;
+
+            if (pixelCounter > 65536)
+            {
+                Serial.println("ERROR: TOO MANY PIXELS");
+            }
+
+            // Loop over the MCUs
+            while (JpegDec.read()) 
+            {
+                MCUCount++;
+                // Skip over the initial set of rows
+                if (JpegDec.MCUy < skip_start_y_mcus) 
+                {
+                    continue;
+                }
+                // Skip if we're on a column that we don't want
+                if (JpegDec.MCUx < skip_start_x_mcus ||
+                JpegDec.MCUx >= skip_end_x_mcu_index) 
+                {
+                    continue;
+                }
+                // Skip if we've got all the rows we want
+                if (JpegDec.MCUy >= skip_end_y_mcu_index) 
+                {
+                    continue;
+                }
+                // Pointer to the current pixel
+                pImg = JpegDec.pImage;
+
+                // The x and y indexes of the current MCU, ignoring the MCUs we skip
+                int relative_mcu_x = JpegDec.MCUx - skip_start_x_mcus;
+                int relative_mcu_y = JpegDec.MCUy - skip_start_y_mcus;
+
+                // The coordinates of the top left of this MCU when applied to the output
+                // image
+                int x_origin = relative_mcu_x * JpegDec.MCUWidth;
+                int y_origin = relative_mcu_y * JpegDec.MCUHeight;
+
+
+                // Loop through the MCU's rows and columns
+                for (int mcu_row = 0; mcu_row < JpegDec.MCUHeight; mcu_row++) 
+                {
+                // The y coordinate of this pixel in the output index
+                    int current_y = y_origin + mcu_row;
+                    for (int mcu_col = 0; mcu_col < JpegDec.MCUWidth; mcu_col++) 
+                    {
+                        color = *pImg++;
+                        // Extract the color values (5 red bits, 6 green, 5 blue)
+                        uint8_t g;
+                        g = ((color & 0x07E0) >> 5) * 4;
+                        // The x coordinate of this pixel in the output image
+                        int current_x = x_origin + mcu_col;
+                        // The index of this pixel in our flat output buffer
+                        int index = (current_y * ROI_WIDTH) + current_x;
+                        gArray[index] = g;
+                    
+                    }
+                }
+            }
+            // Serial.println(index);
+            //Serial.println("End cropping");
+        } 
+        else 
+        {
+            Serial.println(F("Capture not done."));
+        }
+    }
+    return gArray;
+}
+
+void processFFT(uint8_t* greenArray_2D[], uint8_t frameCount) 
+{
+    double avgGreenValues[frameCount];
+    double vReal[samples];
+    double vImag[samples];
+
+    // 计算每帧的绿色通道平均值
+    for (uint8_t j = 0; j < frameCount; j++) 
+    {
+        double sum = 0;
+        for (uint16_t i = 0; i < ROI_SIZE; i++) 
+        {
+            sum += greenArray_2D[j][i];
+        }
+        avgGreenValues[j] = sum / ROI_SIZE;
+        Serial.print(avgGreenValues[j]);
+        Serial.print(F(" "));
+        vImag[j] = 0;
+    }
+    Serial.println(F(" "));
+
+    // 将时间序列信号复制到vReal用于FFT计算
+    for (uint16_t i = 0; i < frameCount; i++) 
+    {
+        vReal[i] = avgGreenValues[i];
+    }
+
+    removeDCComponent(vReal, frameCount);
+    highPassFilter(vReal, frameCount, 1, 8);
+
+    FFT.windowing(vReal, frameCount, FFT_WIN_TYP_HAMMING, FFT_FORWARD); // Windowing
+    Serial.println(F("vReal after windowing"));
+    for (uint16_t i = 0; i < frameCount; i++) 
+    {
+        Serial.print(vReal[i]);
+        Serial.print(F(" "));
+    }
+
+    Serial.println(F(" "));
+    FFT.compute(vReal, vImag, frameCount, FFT_FORWARD); // Compute FFT
+    Serial.println(F("vReal after compute"));
+    for (uint16_t i = 0; i < frameCount; i++) 
+    {
+        Serial.print(vReal[i]);
+        Serial.print(F(" "));
+    }
+
+    Serial.println(F(" "));
+    FFT.complexToMagnitude(vReal, vImag, frameCount); // Compute magnitudes
+    Serial.println(F("vReal after complexToMagnitude"));
+    for (uint16_t i = 0; i < frameCount; i++) 
+    {
+        Serial.print(vReal[i]);
+        Serial.print(F(" "));
+    }
+
+    Serial.println(F(" "));
+    // the position of the peak is likely to be the freq of the heart
+    double peak = FFT.majorPeak(vReal, frameCount, 8);   
+    Serial.print(F("Peak: "));
+    Serial.println(peak);
+    double heartRate = peak * 60.0;
+
+    Serial.print("Estimated Heart Rate: ");
+    Serial.print(heartRate);
+    Serial.println(" BPM");
+
+    // Send heart rate data to the BLE device
+    heartRateCharacteristic.writeValue((int)heartRate);
+}
+
+// 去除直流分量的函数实现
+void removeDCComponent(double* data, uint16_t size) 
+{
+    double sum = 0;
+    for (uint16_t i = 0; i < size; i++) 
+    {
+        sum += data[i];
+    }
+    double mean = sum / size;
+    for (uint16_t i = 0; i < size; i++) 
+    {
+        data[i] -= mean;
+    }
+}
+
+void highPassFilter(double* data, uint16_t size, double cutoff, double sampleRate) {
+    double RC = 1.0 / (cutoff * 2 * 3.141592653589793);
+    double dt = 1.0 / sampleRate;
+    double alpha = dt / (RC + dt);
+
+    double prevData = data[0];
+    for (uint16_t i = 1; i < size; i++) {
+        double temp = data[i];
+        data[i] = alpha * (data[i] - prevData + data[i - 1]);
+        prevData = temp;
+    }
+}
